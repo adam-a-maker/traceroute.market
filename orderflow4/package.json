@@ -1,8 +1,8 @@
 {
-  "name": "orderflow",
+  "name": "traceroute-market",
   "version": "2.0.0",
   "private": true,
-  "description": "Live global market order-flow visualisation — real Yahoo Finance prices, submarine cable routing",
+  "description": "Live global market order-flow map",
   "engines": { "node": ">=18" },
   "scripts": {
     "dev": "vercel dev"
