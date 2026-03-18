@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>ORDERFLOW — Live Market Map</title>
-<meta name="description" content="Visualisation temps réel des flux d'ordres boursiers mondiaux"/>
+<title>traceroute.market — Live Market Order Flow</title>
+<meta name="description" content="Trace live stock orders across the global submarine cable network. Real-time market prices and animated order flow visualization."/>
 
 <!-- Vercel Analytics -->
 <script>window.va=window.va||function(){(window.vaq=window.vaq||[]).push(arguments)};</script>
@@ -369,7 +369,7 @@ kbd {
     <div id="map"></div>
     <canvas id="arc-canvas"></canvas>
     <div id="mol">
-      <div class="chip" style="font-family:'Orbitron',monospace;font-size:8px;letter-spacing:.15em">⬡ ORDERFLOW</div>
+      <div class="chip" style="font-family:'Orbitron',monospace;font-size:8px;letter-spacing:.15em">⬡ TRACEROUTE.MARKET</div>
       <div class="chip" id="arc-chip">0 ARCS ACTIFS</div>
     </div>
     <div id="mt">
@@ -387,7 +387,10 @@ kbd {
         <div class="ch-close" id="ch-close" onclick="closeChart()">✕</div>
       </div>
       <div id="chb">
-        <div id="chcvs"><canvas id="px-chart"></canvas></div>
+        <div id="chcvs">
+          <canvas id="px-chart"></canvas>
+          <div id="ch-wait" style="position:absolute;inset:0;align-items:center;justify-content:center;font-size:9px;color:var(--tx2);letter-spacing:.1em;pointer-events:none;display:none">CHARGEMENT DES DONNÉES…</div>
+        </div>
         <div id="chside">
           <div><div class="csi-l">Ouverture</div><div class="csi-v" id="cs-o">—</div></div>
           <div><div class="csi-l">Haut du jour</div><div class="csi-v up" id="cs-h">—</div></div>
@@ -632,6 +635,36 @@ const PX = {};
 for (const k of MKT_KEYS) PX[k] = { hist:[], labels:[], open:null, high:null, low:null, vol:null, state:null };
 
 /* ════════════════════════════════════════════════════════
+   SEED PRICE HISTORY
+   Charts need ≥1 data point to render. We pre-populate with a
+   synthetic random walk around approximate current values so the
+   chart panel is usable immediately — even before the first API
+   response. Real data replaces / extends these values on the
+   first successful fetchQuotes().
+════════════════════════════════════════════════════════ */
+const BASE_PX = {
+  NYSE: 5600, NASDAQ: 17600, EURONEXT: 8100, LSE: 8350, TSE: 37000, SSE: 3250
+};
+
+function seedPriceHistory() {
+  const now = Date.now();
+  for (const k of MKT_KEYS) {
+    if (PX[k].hist.length > 0) continue; // already seeded
+    let p = BASE_PX[k] || 1000;
+    const drift = p * 0.0008;
+    for (let i = 29; i >= 0; i--) {
+      p += (Math.random() - 0.5) * drift * 2;
+      PX[k].hist.push(parseFloat(p.toFixed(k === 'TSE' || k === 'SSE' ? 0 : 2)));
+      const d = new Date(now - i * 20000);
+      PX[k].labels.push(d.toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit',second:'2-digit'}));
+    }
+    PX[k].open  = PX[k].hist[0];
+    PX[k].high  = Math.max(...PX[k].hist);
+    PX[k].low   = Math.min(...PX[k].hist);
+  }
+}
+
+/* ════════════════════════════════════════════════════════
    MAP
 ════════════════════════════════════════════════════════ */
 const map = L.map('map', {
@@ -707,6 +740,47 @@ function airCtrl(a, b) {
 function h2(n) { return Math.max(0,Math.min(255,Math.floor(n))).toString(16).padStart(2,'0'); }
 
 /* ════════════════════════════════════════════════════════
+   ANTIMERIDIAN HELPERS
+   Cables cross ±180° (trans-Pacific). Naive ll2c gives wrong
+   screen coords because Leaflet always wraps to [-180,180].
+   Solution: normalise route to monotonic longitude, then
+   offset by world-copy width in CSS pixels.
+════════════════════════════════════════════════════════ */
+
+// Make route waypoints consecutive — each lng within 180° of prev.
+// Result may contain lngs outside [-180,180], e.g. -200 or +400.
+function normRoute(wps) {
+  if (!wps || wps.length < 2) return wps || [];
+  const out = [[wps[0][0], wps[0][1]]];
+  for (let i = 1; i < wps.length; i++) {
+    let lng = wps[i][1];
+    const prev = out[i - 1][1];
+    while (lng - prev >  180) lng -= 360;
+    while (prev - lng >  180) lng += 360;
+    out.push([wps[i][0], lng]);
+  }
+  return out;
+}
+
+// Width of the whole world in canvas CSS pixels at current zoom.
+function worldWidthPx() {
+  const a = map.latLngToContainerPoint(L.latLng(0, -180));
+  const b = map.latLngToContainerPoint(L.latLng(0,  180));
+  return Math.abs(b.x - a.x);
+}
+
+// Convert lat + canonical (possibly unwrapped) lng → canvas point.
+// canonical lng may be e.g. -200 (one world-copy west) or +220.
+function ll2cUnwrap(lat, canonicalLng) {
+  // Fold back to [-180,180] for Leaflet
+  const wrapped = ((canonicalLng % 360) + 540) % 360 - 180;
+  const base = map.latLngToContainerPoint(L.latLng(lat, wrapped));
+  const copies = Math.round((canonicalLng - wrapped) / 360);
+  if (copies === 0) return { x: base.x, y: base.y };
+  return { x: base.x + copies * worldWidthPx(), y: base.y };
+}
+
+/* ════════════════════════════════════════════════════════
    MARKERS
 ════════════════════════════════════════════════════════ */
 const mEls = {};
@@ -761,25 +835,32 @@ function initLeft() {
 function updLeft() {
   const mx = Math.max(1,...Object.values(actCnt));
   for (const [k,m] of Object.entries(MKT)) {
-    const rp=realPx[k];
+    const rp = realPx[k];
+    const pe = document.getElementById('mp-'+k);
+    const ce = document.getElementById('mc-'+k);
+    const se = document.getElementById('ms-'+k);
+    const dp = k==='TSE'||k==='SSE' ? 0 : 2;
+
     if (rp) {
-      const pe=document.getElementById('mp-'+k);
-      const ce=document.getElementById('mc-'+k);
-      const se=document.getElementById('ms-'+k);
-      const dp = k==='TSE'||k==='SSE' ? 0 : 2;
+      // Real data received
       if (pe) pe.textContent = rp.price!=null ? rp.price.toFixed(dp) : '—';
       if (ce && rp.chg!=null) {
         ce.textContent=(rp.chg>=0?'+':'')+rp.chg.toFixed(2)+'%';
         ce.className='mi-chg '+(rp.chg>0?'up':rp.chg<0?'dn':'neu');
       }
       if (se) {
-        const open=rp.state==='REGULAR';
-        const pre =rp.state==='PRE';
-        const post=rp.state==='POST';
+        const open=rp.state==='REGULAR', pre=rp.state==='PRE', post=rp.state==='POST';
         se.textContent = open?'● OUVERT':pre?'◑ PRÉ':post?'◑ POST':'○ FERMÉ';
-        se.style.color  = open?'var(--buy)':pre||post?'var(--acc)':'var(--tx2)';
+        se.style.color = open?'var(--buy)':pre||post?'var(--acc)':'var(--tx2)';
       }
+    } else {
+      // No real data yet — show seeded estimate
+      const seedPrice = PX[k].hist.length ? PX[k].hist[PX[k].hist.length-1] : (BASE_PX[k]||0);
+      if (pe) pe.textContent = seedPrice > 0 ? '~'+seedPrice.toFixed(dp) : '—';
+      if (ce) { ce.textContent = 'chargement…'; ce.className='mi-chg neu'; }
+      if (se) { se.textContent = ''; }
     }
+
     const ab=document.getElementById('ab-'+k), an=document.getElementById('an-'+k);
     if (ab) ab.style.width=Math.max(4,(actCnt[k]/mx)*100)+'%';
     if (an) an.textContent=actCnt[k];
@@ -927,8 +1008,11 @@ function drawLoop() {
       }
 
     } else {
-      // ── Catmull-Rom cable route
-      const spx = a.route.map(p => ll2c(p[0],p[1]));
+      // ── Catmull-Rom cable route — antimeridian-safe
+      // Normalise route so longitudes are monotonic (no ±180 jump),
+      // then convert to screen coords via world-copy-aware ll2cUnwrap.
+      const normWps = normRoute(a.route);
+      const spx = normWps.map(p => ll2cUnwrap(p[0], p[1]));
 
       // Full cable path — smooth dashed preview
       const NS=Math.max(spx.length*8,60);
@@ -1088,10 +1172,10 @@ async function fetchQuotes() {
     dot.className='ds-dot ok'; lbl.textContent='Données réelles · 15s';
     updLeft(); if(selMkt) updChart();
   } catch(e) {
-    dot.className='ds-dot err'; lbl.textContent='API indisponible';
+    dot.className='ds-dot err'; lbl.textContent='Source indisponible — réessai…';
+    // Keep seed data visible; retry sooner
   }
 }
-fetchQuotes(); setInterval(fetchQuotes, 15000);
 
 /* ════════════════════════════════════════════════════════
    CHART
@@ -1123,22 +1207,27 @@ function updChart() {
     se.style.cssText=`background:${open?'rgba(61,214,140,.12)':pre||post?'rgba(0,220,184,.08)':'rgba(255,255,255,.04)'};color:${open?'var(--buy)':pre||post?'var(--acc)':'var(--tx2)'};padding:2px 7px;border-radius:3px;font-size:7px;font-weight:700;letter-spacing:.1em`;
   }
 
+  // Show "waiting for data" state on chart if still on seed data
+  const isSeeded = !realPx[k];
+  const waitEl = document.getElementById('ch-wait');
+  if (waitEl) waitEl.style.display = isSeeded ? 'flex' : 'none';
   document.getElementById('cs-o').textContent=px.open!=null?px.open.toFixed(dp):'—';
   document.getElementById('cs-h').textContent=px.high!=null?px.high.toFixed(dp):'—';
   document.getElementById('cs-l').textContent=px.low!=null?px.low.toFixed(dp):'—';
   document.getElementById('cs-v').textContent=px.vol!=null?(px.vol>=1e9?(px.vol/1e9).toFixed(2)+'G':(px.vol/1e6).toFixed(1)+'M'):'—';
 
-  if(!px.hist.length) return;
+  if(!px.hist.length) return; // truly empty — seedPriceHistory() should prevent this
   if(pChart){pChart.destroy();pChart=null;}
 
+  const chartColor = m.color; // always use market color, overlay shows "loading" state
   const c=document.getElementById('px-chart'), ctx3=c.getContext('2d');
-  const g=ctx3.createLinearGradient(0,0,0,200); g.addColorStop(0,m.color+'55'); g.addColorStop(1,m.color+'00');
+  const g=ctx3.createLinearGradient(0,0,0,200); g.addColorStop(0,chartColor+'55'); g.addColorStop(1,chartColor+'00');
 
   pChart=new Chart(c,{
     type:'line',
     data:{
       labels:px.labels.slice(-80),
-      datasets:[{data:px.hist.slice(-80),borderColor:m.color,borderWidth:1.5,fill:true,backgroundColor:g,pointRadius:0,tension:.35}]
+      datasets:[{data:px.hist.slice(-80),borderColor:chartColor,borderWidth:1.5,fill:true,backgroundColor:g,pointRadius:0,tension:.35}]
     },
     options:{
       responsive:true, maintainAspectRatio:false, animation:{duration:200},
@@ -1146,8 +1235,8 @@ function updChart() {
       plugins:{
         legend:{display:false},
         tooltip:{
-          backgroundColor:'rgba(2,5,8,.97)',borderColor:m.color,borderWidth:1,
-          titleColor:m.color,bodyColor:'#6498a8',
+          backgroundColor:'rgba(2,5,8,.97)',borderColor:chartColor,borderWidth:1,
+          titleColor:chartColor,bodyColor:'#6498a8',
           titleFont:{family:'IBM Plex Mono',size:8},bodyFont:{family:'IBM Plex Mono',size:10},
           callbacks:{label:ctx=>` ${ctx.parsed.y.toFixed(dp)} €`}
         }
@@ -1218,6 +1307,17 @@ setInterval(()=>{document.getElementById('clock').textContent=new Date().toLocal
    BOOT
 ════════════════════════════════════════════════════════ */
 initLeft(); initFilters();
+seedPriceHistory();  // charts are renderable immediately
+updLeft();           // show seeded prices in left panel immediately
+fetchQuotes(); setInterval(fetchQuotes, 15000);
+// Aggressive retry for first 2 minutes if API is slow
+let retries = 0;
+const fastRetry = setInterval(() => {
+  retries++;
+  const hasSomeData = Object.values(realPx).some(v => v !== null);
+  if (hasSomeData || retries > 8) { clearInterval(fastRetry); return; }
+  fetchQuotes();
+}, 4000);
 for(let i=0;i<10;i++) setTimeout(genTx,i*80);
 (function sch(){setTimeout(()=>{genTx();sch();},rnd(280,1100));})();
 requestAnimationFrame(drawLoop);
